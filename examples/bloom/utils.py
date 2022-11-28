@@ -153,7 +153,7 @@ def replace_8bit_linear_tp(model, threshold=6.0, modules_to_not_convert="lm_head
     '''
     for name, module in model.named_children():
         if len(list(module.children())) > 0:
-            replace_8bit_linear_tp(module, threshold, modules_to_not_convert)
+            replace_8bit_linear_tp(module, threshold, modules_to_not_convert, convert_none)
 
         if isinstance(module, nn.Linear) and name not in modules_to_not_convert and not convert_none:
                 model._modules[name] = Linear8bitTP(
@@ -161,8 +161,7 @@ def replace_8bit_linear_tp(model, threshold=6.0, modules_to_not_convert="lm_head
                         output_features=module.out_features,
                         threshold=6.0,
                 )
-        
-        if isinstance(module, nn.Embedding):
+        elif isinstance(module, nn.Embedding):
             model._modules[name] = EmbeddingTP(
                 num_embeddings=module.num_embeddings,
                 embedding_dim=module.embedding_dim,
@@ -173,7 +172,7 @@ def replace_8bit_linear_tp(model, threshold=6.0, modules_to_not_convert="lm_head
                 sparse=module.sparse,
                 weight=module.weight,
             )
-        if name in modules_to_not_convert or convert_none:
+        elif isinstance(module, nn.Linear) and (name in modules_to_not_convert or convert_none):
             model._modules[name] = LinearTP(
                 input_features=module.in_features,
                 output_features=module.out_features,
@@ -210,6 +209,7 @@ def load_bloom_for_rank(path : str, rank = 0, world_size = 1, sharding = "tp", d
     if dtype != "int8" and dtype != "fp16":
         raise NotImplementedError
     configuration = BloomConfig.from_json_file(f"{path}/config.json")
+    print(configuration)
     with LazyInitContext(to_meta=True) as ctx:
         model = BloomForCausalLM(configuration)
     # replace layer

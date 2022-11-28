@@ -94,7 +94,15 @@ def model_fn(**model_kwargs):
         from_config = model_kwargs['use_config']
         if from_config:
             print("please save a bloom model using save_bloom_from_config() in utils.py")
-            raise NotImplementedError
+            torch.distributed.barrier()
+            save_now = input("would you like to save the model now?[y/n]")
+            if save_now == 'y':
+                # TODO: save model
+                config = BloomConfig(
+                    hidden_size=0
+                )
+            else:
+                raise NotImplementedError
         
         from utils import load_bloom_for_rank
         model = load_bloom_for_rank(model_name, rank = rank, world_size=tp_world_size, dtype=model_kwargs["dtype"])

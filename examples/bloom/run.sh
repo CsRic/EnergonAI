@@ -14,13 +14,16 @@ CUDA_VISIBLE_DEVICES_set_n_least_memory_usage() {
 }
 
 export GPU_NUM=2
-export DATASET=/data2/users/lczht/bloom-560m # /data2/users/lczht/bloom-560m 
-                                            #/data2/users/lccsr/bloom3b/data 
-                                            #/data2/users/lccsr/bloom1b7/data
-CUDA_VISIBLE_DEVICES_set_n_least_memory_usage ${GPU_NUM} 
-# set up a random model from config.json
-export USE_CONFIG=0
+export DATASET="/home/lccsr/data2/files_2022/bloom/sandbox/BloomFunctionSandbox/bloom40B" 
+# /data2/users/lczht/bloom-560m 
+#/data2/users/lccsr/bloom3b/data 
+#/data2/users/lccsr/bloom1b7/data
+# "/home/lccsr/data2/files_2022/bloom/sandbox/BloomFunctionSandbox/bloom40B"
+
+export USE_CONFIG=0 # set up a random model from config.json
 export USE_INT8=1
+
+CUDA_VISIBLE_DEVICES_set_n_least_memory_usage ${GPU_NUM} 
 if [[ ${USE_CONFIG} == 1 ]]; then
 USE_CONFIG_FLAG="--use_config"
 else
