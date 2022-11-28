@@ -91,76 +91,14 @@ def model_fn(**model_kwargs):
         tp_world_size = torch.distributed.get_world_size()
         rank = torch.distributed.get_rank()
         print(f'init TP world size {tp_world_size}')
-        pg = ProcessGroup(tp_degree=tp_world_size)
-
-        # for test
         from_config = model_kwargs['use_config']
-        # configuration = BloomConfig(hidden_size=8192,  # 64
-        #                             n_layer=40,  # 2
-        #                             n_head=64,  # 8
-        #                             )
-        with open('config.json') as f:
-            config_dict = json.load(f)['random_model']
-            configuration = BloomConfig(**config_dict)
         if from_config:
-            with ColoInitContext(device=torch.cuda.current_device(), dtype=torch.float16, default_pg=pg, default_dist_spec=ShardSpec(dims=[0], num_partitions=[pg.tp_world_size()])):
-                with torch.no_grad():
-                    colo_model = BloomForCausalLM(configuration)
-        else:
-            with ColoInitContext(device=torch.cuda.current_device(), dtype=torch.float16, default_pg=pg):
-                with torch.no_grad():
-                    colo_model = BloomForCausalLM.from_pretrained(model_name)
-
-        def split_param_single_dim_tp1d(dim: int, param: ColoParameter, pg: ProcessGroup):
-            spec = (ShardSpec([dim], [pg.tp_world_size()]), ComputeSpec(ComputePattern.TP1D))
-            if param.process_group.tp_world_size() == 1:
-                param.set_process_group(pg)
-            param.set_tensor_spec(*spec)
-
-        def split_param_row_tp1d(param: ColoParameter, pg: ProcessGroup):
-            split_param_single_dim_tp1d(0, param, pg)
-
-        if model_kwargs["dtype"] == "fp16":
-            num_params = 0
-            num_params_total = 0
-            for mn, module in colo_model.named_modules():
-                for pn, param in module.named_parameters(recurse=True):
-                    # reset process group for all parameters
-                    if hasattr(param, 'is_visited'):
-                        continue
-                    param_name = f"{mn}.{pn}"
-                    use_shard = False
-                    for target in TP_TARGET:
-                        if target in param_name:
-                            split_param_row_tp1d(param, pg)
-                            use_shard = True
-                            break
-                    if not use_shard:
-                        param.set_dist_spec(ReplicaSpec())
-                    param.requires_grad_(False)
-                    print(param.requires_grad)
-                    if use_shard:
-                        num_params_total += param.numel() * tp_world_size
-                    else:
-                        num_params_total += param.numel()
-                    num_params += param.numel()
-                    param.is_visited = True
-            print('initialize TP OK')
-            print(f"num_params: {num_params}")
-            print(f"num_params_total: {num_params_total}")
-        elif model_kwargs["dtype"] == "int8":
-            from utils import get_8bit_tp_model,replace_8bit_linear_tp_coloparam
-            colo_model = replace_8bit_linear_tp_coloparam(colo_model).to(rank)
-            colo_model = get_8bit_tp_model(colo_model, rank, tp_world_size)
-            num_params = 0
-            for pn, param in colo_model.named_parameters(recurse=True):
-                if hasattr(param, 'is_visited'):
-                    continue
-                num_params += param.numel()
-                print(pn,param.dtype)
-                param.is_visited = True
-            print(f"num_params: {num_params}")
-        return WrapCallModule(colo_model)
+            print("please save a bloom model using save_bloom_from_config() in utils.py")
+            raise NotImplementedError
+        
+        from utils import load_bloom_for_rank
+        model = load_bloom_for_rank(model_name, rank = rank, world_size=tp_world_size, dtype=model_kwargs["dtype"])
+        return WrapCallModule(model)
     else:
         # This is for single process debug
         # model config only:
@@ -210,8 +148,9 @@ if __name__ == '__main__':
     else:
         model_kwargs['use_config'] = False
     logger = logging.getLogger(__name__)
-
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    # token_name = model_name
+    token_name = "/data2/users/lczht/bloom-560m"
+    tokenizer = AutoTokenizer.from_pretrained(token_name)
 
     if args.cache_size > 0:
         cache = ListCache(args.cache_size, args.cache_list_size,

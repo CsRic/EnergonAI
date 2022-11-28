@@ -146,12 +146,16 @@ class EmbeddingTP(torch.nn.Embedding):
         del tensor_list
         return emb
 
-def replace_8bit_linear_tp(model, threshold=6.0, modules_to_not_convert="lm_head"):
+def replace_8bit_linear_tp(model, threshold=6.0, modules_to_not_convert="lm_head", convert_none=False):
+    '''
+    modules_to_not_convert: Linear modules supposed to not be quantized
+    convert_none: None of the linear modules should be quantized
+    '''
     for name, module in model.named_children():
         if len(list(module.children())) > 0:
             replace_8bit_linear_tp(module, threshold, modules_to_not_convert)
 
-        if isinstance(module, nn.Linear) and name not in modules_to_not_convert:
+        if isinstance(module, nn.Linear) and name not in modules_to_not_convert and not convert_none:
                 model._modules[name] = Linear8bitTP(
                         input_features=module.in_features,
                         output_features=module.out_features,
@@ -169,7 +173,7 @@ def replace_8bit_linear_tp(model, threshold=6.0, modules_to_not_convert="lm_head
                 sparse=module.sparse,
                 weight=module.weight,
             )
-        if name == 'lm_head':
+        if name in modules_to_not_convert or convert_none:
             model._modules[name] = LinearTP(
                 input_features=module.in_features,
                 output_features=module.out_features,
@@ -203,14 +207,16 @@ def save_bloom_from_config(configuration : BloomConfig, path = "checkpoint", str
 def load_bloom_for_rank(path : str, rank = 0, world_size = 1, sharding = "tp", dtype = "int8"):
     if sharding != "tp":
         raise NotImplementedError
-    if dtype != "int8":
+    if dtype != "int8" and dtype != "fp16":
         raise NotImplementedError
     configuration = BloomConfig.from_json_file(f"{path}/config.json")
     with LazyInitContext(to_meta=True) as ctx:
         model = BloomForCausalLM(configuration)
     # replace layer
-    replace_8bit_linear_tp(model)
-    
+    if dtype == "int8":
+        replace_8bit_linear_tp(model)
+    elif dtype == "fp16":
+        replace_8bit_linear_tp(model, convert_none=True)
     filenames = []
     for f in os.listdir(path):
         if f.endswith(".safetensors"):
