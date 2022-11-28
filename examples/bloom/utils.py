@@ -1,3 +1,10 @@
+from safetensors.torch import save_file
+from safetensors import safe_open
+from transformers import BloomForCausalLM, BloomConfig
+from itertools import islice
+import os
+from colossalai.utils.model.lazy_init_context import LazyInitContext
+
 import torch
 from torch import nn, Tensor
 import torch.distributed as dist
@@ -6,6 +13,7 @@ import torch.nn.functional as F
 from typing import Optional
 from torch.distributed.distributed_c10d import ReduceOp
 from colossalai.tensor import ColoParameter, ReplicaSpec
+
 
 class Int8Params(torch.nn.Parameter):
     def __new__(
@@ -26,7 +34,7 @@ class Int8Params(torch.nn.Parameter):
     def __init__(self, data, SCB, requires_grad=False):
         super(Int8Params, self).__init__
         self.SCB = SCB
-        self.data = data
+        self.data = data if data != None else torch.empty(0)
 
 class Linear8bitTP(nn.Linear):
     def __init__(
@@ -55,19 +63,21 @@ class Linear8bitTP(nn.Linear):
 
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
-        weight = weight_data.data.contiguous().half().to(self.rank)
-
-        CB, _, SCB, _, _ = bnb.functional.double_quant(weight)
+        weight = weight_data
+        if weight != None:
+            CB, _, SCB, _, _ = bnb.functional.double_quant(weight)
+        else:
+            CB, SCB = None, None
         delattr(self, "weight")
         setattr(self, "weight", Int8Params(data=CB, SCB=SCB))
         self.weight.data = self.weight.data.to("cpu")
 
     def forward(self, x):
         self.state.is_training = self.training
-        
+
         if self.bias is not None and self.bias.dtype != torch.float16:
             self.bias.data = self.bias.data.half()
-        
+
         self.state.CB = self.weight.data
         self.state.SCB = self.weight.SCB
         out = bnb.matmul(x, self.weight, bias=self.bias, state=self.state)
@@ -76,51 +86,7 @@ class Linear8bitTP(nn.Linear):
         out = torch.cat(tensor_list, dim=2)
         del tensor_list
         del self.state.CxB
-        
-        return out
 
-class Linear8bit(nn.Linear):
-    def __init__(
-        self,
-        input_features,
-        output_features,
-        bias=True,
-        has_fp16_weights=False,
-        memory_efficient_backward=False,
-        threshold=6.0,
-        weight_data=None,
-        index=None,
-        bias_data=None
-    ):
-        super(Linear8bit, self).__init__(
-            input_features, output_features, bias
-        )
-        self.state = bnb.MatmulLtState()
-        self.index = index
-        self.bias = bias_data
-        self.state.threshold = threshold
-        self.state.has_fp16_weights = has_fp16_weights
-        self.state.memory_efficient_backward = memory_efficient_backward
-        if threshold > 0.0 and not has_fp16_weights:
-            self.state.use_pool = True
-
-        weight = weight_data.data.contiguous().half().to(torch.cuda.current_device())
-
-        CB, _, SCB, _, _ = bnb.functional.double_quant(weight)
-        delattr(self, "weight")
-        setattr(self, "weight", Int8Params(data=CB, SCB=SCB))
-
-    def forward(self, x):
-        self.state.is_training = self.training
-        
-        if self.bias is not None and self.bias.dtype != torch.float16:
-            self.bias.data = self.bias.data.half()
-        
-        self.state.CB = self.weight.data
-        self.state.SCB = self.weight.SCB
-        out = bnb.matmul(x, self.weight, bias=self.bias, state=self.state)
-        del self.state.CxB
-        
         return out
 
 class LinearTP(torch.nn.Linear):
@@ -180,7 +146,6 @@ class EmbeddingTP(torch.nn.Embedding):
         del tensor_list
         return emb
 
-
 def replace_8bit_linear_tp(model, threshold=6.0, modules_to_not_convert="lm_head"):
     for name, module in model.named_children():
         if len(list(module.children())) > 0:
@@ -191,8 +156,6 @@ def replace_8bit_linear_tp(model, threshold=6.0, modules_to_not_convert="lm_head
                         input_features=module.in_features,
                         output_features=module.out_features,
                         threshold=6.0,
-                        weight_data=module.weight,
-                        bias_data=module.bias,
                 )
         
         if isinstance(module, nn.Embedding):
@@ -215,143 +178,68 @@ def replace_8bit_linear_tp(model, threshold=6.0, modules_to_not_convert="lm_head
             )
     return model
 
-def replace_8bit_linear(model, threshold=6.0, modules_to_not_convert="lm_head"):
-    for name, module in model.named_children():
-        if len(list(module.children())) > 0:
-            replace_8bit_linear(module, threshold, modules_to_not_convert)
+def save_full_model(model, path: str = "checkpoint", stride=12, ):
+    '''
+    save a full model from configuration, no sharding, no quantization
+    model: cpu model
+    path: saved position
+    stride: num tensors per saved file
+    '''
+    try:
+        os.mkdir(path)
+    except:
+        pass
+    num_files = (len(model.state_dict()) - 1) // stride + 1
+    for i in range(num_files):
+        batch = dict(islice(model.state_dict().items(), i * stride, (i + 1) * stride))
+        save_file(batch, os.path.join(path, f"part_{i}.safetensors"))
+        print(f"{i + 1} / {num_files}")
 
-        if isinstance(module, nn.Linear) and name not in modules_to_not_convert:
-            model._modules[name] = Linear8bit(
-                    input_features=module.in_features,
-                    output_features=module.out_features,
-                    threshold=6.0,
-                    weight_data=module.weight,
-                    bias_data=module.bias,
-                )
+def save_bloom_from_config(configuration : BloomConfig, path = "checkpoint", stride = 12):
+    model = BloomForCausalLM(configuration)
+    save_full_model(model, path, stride)
+    model.config.save_pretrained(path)
     
-    return model
-
-def get_8bit_tp_model(model, rank, world_size):
-    for name, module in model.named_modules():
-        if isinstance(module, Linear8bitTP):
-            weight_list = list(module.weight.data.chunk(world_size, dim=0))
-            weight = weight_list[rank]
-            weight_list.clear()
-            SCB_list = list(module.weight.SCB.chunk(world_size, dim=0))
-            SCB = SCB_list[rank]
-            int8_param = Int8Params(data=weight.clone().detach(), SCB=SCB)
-            delattr(module, "weight")
-            setattr(module, "weight", int8_param)
-
-            bias_list = list(module.bias.data.chunk(world_size, dim=0))
-            bias = bias_list[rank].clone().detach()
-            delattr(module, "bias")
-            setattr(module, "bias", nn.Parameter(bias))
-            
-        if isinstance(module, EmbeddingTP):   
-            weight_list = list(module.weight.chunk(world_size, dim=1))
-            weight = nn.Parameter(weight_list[rank].clone().detach())
-            delattr(module, 'weight')
-            setattr(module, 'weight', weight)
-            
-        if isinstance(module, LinearTP):
-            delattr(module, 'weight')
-            setattr(module, 'weight', model._modules['transformer']._modules['word_embeddings'].weight)
-            
-        
-    return model
-
-
-def get_8bit_tp_model_from_colomodule(model, world_size=1, rank=0, threshold=6.0, modules_to_not_convert="lm_head"):
-    replaced_tensors = dict()
-    param_count = 0
-    repeat_count = 0
-    torch.cuda.reset_peak_memory_stats(rank)
+def load_bloom_for_rank(path : str, rank = 0, world_size = 1, sharding = "tp", dtype = "int8"):
+    if sharding != "tp":
+        raise NotImplementedError
+    if dtype != "int8":
+        raise NotImplementedError
+    configuration = BloomConfig.from_json_file(f"{path}/config.json")
+    with LazyInitContext(to_meta=True) as ctx:
+        model = BloomForCausalLM(configuration)
+    # replace layer
+    replace_8bit_linear_tp(model)
     
-    def replace_8bit_linear_tp_from_coloparam(model, threshold=6.0, modules_to_not_convert="lm_head"):
-        nonlocal replaced_tensors
-        nonlocal param_count
-        nonlocal repeat_count
-        '''
-        Assert model initialized from ColoInitContext(model contains coloparameters). 
-        Need to 'degrade' it to normal pytorch model(contains pytorchparameters)
-        '''
-        for name, module in model.named_children():
-            if len(list(module.children())) > 0:
-                replace_8bit_linear_tp_from_coloparam(module, threshold, modules_to_not_convert)
-            # coloparamter -> parameter
-            for pn, param in module.named_parameters(recurse=True):
-                param_count += 1
-                if isinstance(param, ColoParameter):
-                    if param in replaced_tensors:
-                        repeat_count += 1
-                        torch_param = replaced_tensors[param]
-                    else :
-                        param.set_dist_spec(ReplicaSpec())
-                        param.data = param.data.to("cpu")
-                        torch_param = nn.Parameter(param.data)
-                        torch_param.requires_grad_(False)
-                        replaced_tensors[param] = torch_param
+    filenames = []
+    for f in os.listdir(path):
+        if f.endswith(".safetensors"):
+            filenames.append(os.path.join(path, f))
+    for filename in filenames:
+        with safe_open(filename, framework="pt", device="cpu") as f:
+            for name in f.keys():
+                if name == 'lm_head.weight':
+                    continue
+                full_name = name
+                module_name, param_name = full_name.rsplit(".", 1)
+                module = model.get_submodule(module_name)
+                tensor = f.get_tensor(name).data.contiguous().half().to(rank)
+                
+                if isinstance(module, Linear8bitTP):
+                    if "weight" in param_name:
+                        weight = tensor
+                        CB, _, SCB, _, _ = bnb.functional.double_quant(weight)
+                        module._parameters[param_name] = Int8Params(data=list(CB.chunk(world_size, dim=0))[rank].clone().detach(),
+                                                                    SCB=list(SCB.chunk(world_size, dim=0))[rank].clone().detach())
                         
-                    module._parameters[pn] = torch_param
-
-            if isinstance(module, nn.Linear) and name not in modules_to_not_convert:
-                module = Linear8bitTP(
-                        input_features=module.in_features,
-                        output_features=module.out_features,
-                        threshold=6.0,
-                        weight_data=module.weight,
-                        bias_data=module.bias,
-                )
-                
-
-                weight_list = list(module.weight.data.chunk(world_size, dim=0))
-                weight = weight_list[rank].clone().detach()
-
-                SCB_list = list(module.weight.SCB.chunk(world_size, dim=0))
-                SCB = SCB_list[rank]
-                delattr(module, "weight")
-                setattr(module, "weight", Int8Params(data=weight, SCB=SCB))
-                bias_list = list(module.bias.data.chunk(world_size, dim=0))
-                bias = bias_list[rank].clone().detach()
-                delattr(module, "bias")
-                setattr(module, "bias", nn.Parameter(bias))
-                model._modules[name] = module
-            if isinstance(module, nn.Embedding):
-                module = EmbeddingTP(
-                    num_embeddings=module.num_embeddings,
-                    embedding_dim=module.embedding_dim,
-                    padding_idx=module.padding_idx,
-                    max_norm=module.max_norm,
-                    norm_type=module.norm_type,
-                    scale_grad_by_freq=module.scale_grad_by_freq,
-                    sparse=module.sparse,
-                    weight=module.weight,
-                )
-                
-                weight_list = list(module.weight.chunk(world_size, dim=1))
-                delattr(module, 'weight')
-                weight = nn.Parameter(weight_list[rank].clone().detach())
-                setattr(module, 'weight', weight)
-                model._modules[name] = module
-            if name == 'lm_head':
-                module = LinearTP(
-                    input_features=module.in_features,
-                    output_features=module.out_features,
-                    weight_data=module.weight,
-                    bias=False,
-                )
-                
-                delattr(module, 'weight')
-                setattr(module, 'weight', model._modules['transformer']._modules['word_embeddings'].weight)
-                model._modules[name] = module
-            model._modules[name].to(rank)
-        return model
-    
-    ret =  replace_8bit_linear_tp_from_coloparam(model, threshold=threshold, modules_to_not_convert=modules_to_not_convert)
-    del replaced_tensors
-    print(f"param_count : {param_count}")
-    print(f"repeat_count: {repeat_count}")
-    max_usage = torch.cuda.max_memory_allocated(rank)
-    print(f"max cuda memory usage: {max_usage / 1024 /1024} MB")
-    return ret
+                    elif "bias" in param_name:
+                        bias = tensor
+                        module._parameters[param_name] = list(bias.chunk(world_size, dim=0))[rank].clone().detach()
+                elif isinstance(module, EmbeddingTP):
+                    weight = tensor
+                    module._parameters[param_name] = list(weight.chunk(world_size, dim=1))[rank].clone().detach()
+                else:
+                    module._parameters[param_name] = tensor
+                if name == "transformer.word_embeddings.weight":
+                    model.lm_head._parameters["weight"] = module.weight
+    return model
